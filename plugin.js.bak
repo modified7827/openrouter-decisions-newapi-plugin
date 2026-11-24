@@ -1,0 +1,244 @@
+// OpenRouter provider plugin.
+//
+// 一个渠道同时提供：
+//   - meta.relay 路由表：把 new-api 已有的客户端入口透传到 OpenRouter 的同名端点
+//     （chat / messages / responses / embeddings / rerank / images / audio / models）
+//   - meta.routes 新入口：POST /v1/alpha/decisions → OpenRouter /api/alpha/decisions
+//   - openai_video 协议：POST /v1/videos → OpenRouter 异步视频任务（提交/轮询/取内容）
+//
+// 模型名映射由渠道的 model_mapping 完成（下游名 → 上游名），本插件不处理改名：
+// 计费与日志按下原名（ctx.model），上游请求发映射名（ctx.upstreamModel）。
+
+export const meta = {
+  apiVersion: 1,
+  key: "openrouter",
+  name: "OpenRouter",
+  icon: "text:OR",
+  description: {
+    en: "OpenRouter unified gateway: chat, messages, responses, embeddings, rerank, images, audio, decisions and async video",
+    zh: "OpenRouter 统一网关：对话、Messages、Responses、向量、重排、图像、音频、Decisions 与异步视频",
+  },
+  version: "1.0.1",
+  author: { name: "Custom" },
+  baseUrl: "https://openrouter.ai/api",
+
+  // meta.models 是插件声称可用的模型集合：原生路由在 decode 之前就按它校验
+  // 客户端的 model 字段，openai_video 协议也按它绑定模型。
+  // 这里必须含【下游别名】（与渠道模型列表/令牌范围一致），上游模型 id 只作参考。
+  models: [
+    "Decisions",
+    "parallel/decisions-fast:free", // 映射尾巴也列入:别名解析或直接发原名都能命中
+    "typesafe/jev-1.14",
+    "cloudflare/clef-flash",
+    "inception/mercury-decide",
+    "google/veo-3.1",
+  ],
+
+  fetchMode: "per_task",
+
+  // 视频按秒计费（OpenRouter 请求体用 duration 字段）。Decisions 走
+  // <pluginKey>::<model> 的按次模型价，无需 usage 字段。
+  usageSchema: {
+    seconds: {
+      type: "number",
+      unit: "second",
+      description: { en: "Video generation unit price", zh: "视频生成单价" },
+    },
+  },
+
+  // 异步视频：OpenRouter 的 /api/v1/videos 是 submit → poll → /content 的形状，
+  // 与宿主 openai_video 协议同构。models 收窄到视频模型,避免别的别名占用 /v1/videos。
+  protocols: [{ name: "openai_video", models: ["google/veo-3.1"] }],
+
+  // 客户端可见的新入口（网关原本没有此路径）。另自动获得
+  // /openrouter/v1/alpha/decisions 的 {key} 前缀副本。
+  routes: [
+    {
+      method: "POST",
+      path: "/v1/alpha/decisions",
+      type: "submit",
+      decode: "decodeDecisions",
+      render: "renderDecisions",
+      retainResult: false, // 同步接口、无任务可查，不持久化上游快照
+    },
+  ],
+
+  // 已有入口路径的分发表。converter 缺省 none = 原样透传；
+  // models 过滤匹配下游名（渠道里配的能力别名，大小写敏感），按声明顺序
+  // 首个命中生效，{model} 占位符替换为 model_mapping 映射后名。
+  //
+  // 注意：不要在 /v1/chat/completions 上做按别名分流到其他端点的路由——
+  // 网关会先按 chat 格式校验 body（必须含 messages），非 chat 请求体
+  // 到不了路由就 400。各能力客户端直接调对应路径即可。
+  relay: [
+    { incoming_path: "/v1/chat/completions", upstream_path: "/v1/chat/completions" },
+    { incoming_path: "/v1/messages", upstream_path: "/v1/messages" },
+    { incoming_path: "/v1/responses", upstream_path: "/v1/responses" },
+    { incoming_path: "/v1/embeddings", upstream_path: "/v1/embeddings" },
+    { incoming_path: "/v1/rerank", upstream_path: "/v1/rerank" },
+    { incoming_path: "/v1/images/generations", upstream_path: "/v1/images/generations" },
+    { incoming_path: "/v1/audio/speech", upstream_path: "/v1/audio/speech" },
+    { incoming_path: "/v1/audio/transcriptions", upstream_path: "/v1/audio/transcriptions" },
+    { incoming_path: "/v1/models", upstream_path: "/v1/models" },
+    // 可选：把 decisions 也挂到已存在的 /v1/alpha/search 入口（响应原样透传，
+    // 但计费固定按一次 web_search_preview 工具调用计）。正式入口用上面的 task 路由。
+    // { incoming_path: "/v1/alpha/search", upstream_path: "/alpha/decisions" },
+  ],
+};
+
+function trimmed(value) {
+  return String(value || "").trim();
+}
+
+function bearer(ctx) {
+  return { Authorization: "Bearer " + ctx.apiKey };
+}
+
+// ---------------------------------------------------------------------------
+// Driver hooks：decisions 与 video 共用，按 ctx.action 区分。
+// ---------------------------------------------------------------------------
+
+export function buildSubmitRequest(ctx) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, bearer(ctx));
+  const body = Object.assign({}, ctx.requestBody, { model: ctx.upstreamModel || ctx.model });
+  if (ctx.action === "decisions") {
+    return { url: ctx.baseUrl + "/alpha/decisions", method: "POST", headers, body };
+  }
+  return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, body };
+}
+
+export function parseSubmitResponse(ctx, resp) {
+  const body = resp.body || {};
+  if (ctx.action === "decisions") {
+    const taskId = body.id || body.request_id || "decision-" + Date.now();
+    if (body.error) {
+      return { taskId, taskData: body, immediate: { status: "FAILURE" } };
+    }
+    return { taskId, taskData: body, immediate: { status: "SUCCESS" } };
+  }
+  const taskId = body.id || body.task_id;
+  if (!taskId) throw new Error("task_id is empty");
+  return { taskId, taskData: body };
+}
+
+export function buildQueryRequest(ctx) {
+  return { url: ctx.baseUrl + "/v1/videos/" + ctx.taskId, method: "GET", headers: bearer(ctx) };
+}
+
+export function parseTaskResult(ctx, body) {
+  const statuses = {
+    pending: "QUEUED",
+    in_progress: "IN_PROGRESS",
+    completed: "SUCCESS",
+    failed: "FAILURE",
+    cancelled: "FAILURE",
+    expired: "FAILURE",
+  };
+  const mapped = statuses[body.status];
+  const result = { status: mapped || "UNKNOWN" };
+  if (!mapped) result.reason = "unrecognized status: " + String(body.status || "");
+  const progress = Number(body.progress);
+  if (Number.isFinite(progress) && progress > 0 && progress < 100) result.progress = progress + "%";
+  if (result.status === "FAILURE") {
+    const upstream = body.error;
+    result.reason = upstream && (upstream.message || upstream.code) ? String(upstream.message || upstream.code) : "video generation " + String(body.status || "failed");
+  }
+  return result;
+}
+
+export function extractUsage(ctx) {
+  const req = ctx.requestBody || {};
+  const seconds = Number(req.duration === undefined ? req.seconds : req.duration);
+  return { seconds: Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 3600) : 0 };
+}
+
+export function extractUsageOnComplete(ctx, result, body) {
+  const facts = {};
+  const seconds = Number((body || {}).duration || (body || {}).seconds || 0);
+  if (Number.isFinite(seconds) && seconds > 0) facts.seconds = Math.min(seconds, 3600);
+  return facts;
+}
+
+export function listArtifacts(task) {
+  return task.status === "SUCCESS" ? [{ key: "video", type: "video" }] : [];
+}
+
+export function buildContentRequest(ctx) {
+  if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
+  return {
+    url: ctx.baseUrl + "/v1/videos/" + encodeURIComponent(ctx.upstreamTaskId) + "/content",
+    method: ctx.clientRequest.method,
+    headers: bearer(ctx),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 余额：GET /api/v1/credits → {data:{total_credits,total_usage}}
+// ---------------------------------------------------------------------------
+
+export function buildBalanceRequest(ctx) {
+  return { path: "/v1/credits", headers: bearer(ctx) };
+}
+
+export function parseBalance(ctx, response) {
+  if (response.status !== 200) return { error: "credits query failed with status " + response.status };
+  let parsed;
+  try {
+    parsed = JSON.parse(response.body || "{}");
+  } catch (e) {
+    return { error: "unexpected credits response" };
+  }
+  const data = parsed.data;
+  if (!data || !Number.isFinite(Number(data.total_credits)) || !Number.isFinite(Number(data.total_usage))) {
+    return { error: "unexpected credits response" };
+  }
+  return { amount: Number(data.total_credits) - Number(data.total_usage), currency: "USD" };
+}
+
+// ---------------------------------------------------------------------------
+// openai_video 协议：POST /v1/videos 提交，GET /v1/videos/:task_id 查询渲染。
+// ---------------------------------------------------------------------------
+
+export const protocols = {
+  openai_video: {
+    decodeRequest: function (ctx) {
+      if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
+      const req = ctx.body.value;
+      if (!req || typeof req !== "object" || Array.isArray(req)) throw new Error("request body must be an object");
+      if (!trimmed(req.prompt)) throw new Error("prompt is required");
+      const seconds = req.duration === undefined ? req.seconds : req.duration;
+      if (seconds !== undefined && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600)) {
+        throw new Error("duration must be between 1 and 3600 seconds");
+      }
+      return { kind: "submit", model: ctx.model, action: "video", requestBody: Object.assign({}, req, { model: ctx.model }) };
+    },
+    render: function (ctx, task) {
+      const data = task.data;
+      const output = data && typeof data === "object" && !Array.isArray(data) ? Object.assign({}, data) : {};
+      const artifact = ctx && ctx.artifacts && ctx.artifacts.video;
+      if (artifact && trimmed(artifact.url)) output.content_url = artifact.url;
+      return output;
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 原生路由：POST /v1/alpha/decisions → POST {baseUrl}/alpha/decisions
+// ---------------------------------------------------------------------------
+
+export const native = {
+  decodeDecisions: function (ctx) {
+    if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
+    const req = ctx.body.value;
+    if (!req || typeof req !== "object" || Array.isArray(req)) throw new Error("request body must be an object");
+    const model = trimmed(req.model);
+    if (!model) throw new Error("model is required");
+    if (!req.questions || typeof req.questions !== "object" || Array.isArray(req.questions)) throw new Error("questions must be an object");
+    if (req.state === undefined) throw new Error("state is required");
+    return { kind: "submit", model: model, action: "decisions", requestBody: req };
+  },
+  renderDecisions: function (ctx, task) {
+    if (task.data && typeof task.data === "object" && !Array.isArray(task.data)) return task.data;
+    return {};
+  },
+};
